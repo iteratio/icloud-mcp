@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Credential management via macOS Keychain.
 
@@ -5,9 +6,9 @@ Credentials are stored under the service name 'icloud-mcp' and never
 written to disk, environment variables, or source code.
 
 Usage:
-    python auth.py store   # interactively store credentials
-    python auth.py verify  # test credentials against iCloud
-    python auth.py clear   # remove stored credentials
+    uv run python3 auth.py store   # interactively store credentials
+    uv run python3 auth.py verify  # test credentials against iCloud
+    uv run python3 auth.py clear   # remove stored credentials
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ def store_credentials() -> None:
     keyring.set_password(SERVICE, KEY_APP_PASSWORD, app_password)
 
     print(f"\nCredentials stored in macOS Keychain under service '{SERVICE}'.")
-    print("Run 'python auth.py verify' to test them.")
+    print("Run 'uv run python3 auth.py verify' to test them.")
 
 
 def get_credentials() -> tuple[str, str]:
@@ -63,7 +64,7 @@ def get_credentials() -> tuple[str, str]:
     if not apple_id or not app_password:
         raise RuntimeError(
             "iCloud credentials not found in Keychain.\n"
-            "Run: python auth.py store"
+            "Run: uv run python3 auth.py store"
         )
 
     return apple_id, app_password

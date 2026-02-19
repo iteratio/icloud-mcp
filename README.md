@@ -30,7 +30,7 @@ uv sync
 ### 2. Store your credentials
 
 ```bash
-uv run python auth.py store
+uv run python3 auth.py store
 ```
 
 You will be prompted for:
@@ -42,7 +42,7 @@ Credentials are stored in the macOS Keychain under the service name `icloud-mcp`
 ### 3. Verify credentials
 
 ```bash
-uv run python auth.py verify
+uv run python3 auth.py verify
 ```
 
 ### 4. Add to Claude Code
@@ -54,7 +54,7 @@ Add the server to your Claude Code MCP configuration (`~/.claude/claude_desktop_
   "mcpServers": {
     "icloud": {
       "command": "uv",
-      "args": ["run", "python", "/path/to/iCloudMCP/server.py"]
+      "args": ["run", "python3", "/path/to/iCloudMCP/server.py"]
     }
   }
 }
@@ -95,13 +95,13 @@ Replace `/path/to/iCloudMCP` with the actual path to this repository.
 
 ```bash
 # Store credentials
-uv run python auth.py store
+uv run python3 auth.py store
 
 # Test authentication
-uv run python auth.py verify
+uv run python3 auth.py verify
 
 # Remove credentials from Keychain
-uv run python auth.py clear
+uv run python3 auth.py clear
 ```
 
 ## Two-factor authentication
@@ -115,7 +115,7 @@ If your Apple ID has 2FA enabled (recommended), the server will prompt for a 6-d
 uv sync
 
 # Run the server directly (for testing)
-uv run python server.py
+uv run python3 server.py
 ```
 
 ## Disclaimer
