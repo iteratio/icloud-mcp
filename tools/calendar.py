@@ -1,42 +1,69 @@
-"""iCloud Calendar tools for MCP."""
+"""iCloud Calendar tools — CalDAV implementation.
+
+Uses Apple's official CalDAV endpoint with Basic Auth (app-specific password).
+No pyicloud dependency.
+"""
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import caldav
 from dateutil import parser as dateparser
+from icalendar import Calendar as iCalendar
+from icalendar import Event as iCalEvent
+
+ICLOUD_CALDAV_URL = "https://caldav.icloud.com/"
 
 
-def _fmt_event(event: Any) -> dict:
-    """Normalise a pyicloud calendar event to a plain dict."""
-    data = event.get("fields", event) if hasattr(event, "get") else {}
+def _client(apple_id: str, app_password: str) -> caldav.DAVClient:
+    """Return an authenticated CalDAV client."""
+    return caldav.DAVClient(
+        url=ICLOUD_CALDAV_URL,
+        username=apple_id,
+        password=app_password,
+    )
+
+
+def _fmt_calendar(cal: caldav.Calendar) -> dict:
     return {
-        "uid": data.get("guid", ""),
-        "title": data.get("title", "(no title)"),
-        "start": str(data.get("startDate", "")),
-        "end": str(data.get("endDate", "")),
-        "location": data.get("location", ""),
-        "description": data.get("description", ""),
-        "calendar": data.get("pGuid", ""),
+        "uid": str(cal.id),
+        "title": cal.name or "(unnamed)",
+        "url": str(cal.url),
     }
 
 
-def list_calendars(api: Any) -> list[dict]:
+def _fmt_event(vevent: Any) -> dict:
+    """Extract a plain dict from a vobject/icalendar VEVENT component."""
+    def _str(val: Any) -> str:
+        if val is None:
+            return ""
+        if hasattr(val, "dt"):
+            return val.dt.isoformat() if val.dt else ""
+        return str(val)
+
+    return {
+        "uid": _str(vevent.get("uid")),
+        "title": _str(vevent.get("summary")),
+        "start": _str(vevent.get("dtstart")),
+        "end": _str(vevent.get("dtend")),
+        "location": _str(vevent.get("location")),
+        "description": _str(vevent.get("description")),
+    }
+
+
+def list_calendars(apple_id: str, app_password: str) -> list[dict]:
     """Return all calendars for the account."""
-    calendars = api.calendar.calendars()
-    return [
-        {
-            "uid": cal.get("guid", ""),
-            "title": cal.get("title", ""),
-            "color": cal.get("color", ""),
-        }
-        for cal in calendars
-    ]
+    client = _client(apple_id, app_password)
+    principal = client.principal()
+    return [_fmt_calendar(c) for c in principal.calendars()]
 
 
 def list_events(
-    api: Any,
+    apple_id: str,
+    app_password: str,
     from_date: str | None = None,
     to_date: str | None = None,
     calendar_uid: str | None = None,
@@ -45,7 +72,8 @@ def list_events(
     Return events in the given date range.
 
     Args:
-        api: Authenticated PyiCloudService instance.
+        apple_id: iCloud Apple ID.
+        app_password: App-specific password.
         from_date: ISO-8601 start date (default: today).
         to_date: ISO-8601 end date (default: 7 days from today).
         calendar_uid: Restrict to a specific calendar by UID.
@@ -54,30 +82,60 @@ def list_events(
     start = dateparser.parse(from_date) if from_date else now
     end = dateparser.parse(to_date) if to_date else now + timedelta(days=7)
 
-    events = api.calendar.events(start, end)
-    result = [_fmt_event(e) for e in events]
+    client = _client(apple_id, app_password)
+    principal = client.principal()
+    calendars = principal.calendars()
 
     if calendar_uid:
-        result = [e for e in result if e["calendar"] == calendar_uid]
+        calendars = [c for c in calendars if str(c.id) == calendar_uid]
 
-    return result
+    results: list[dict] = []
+    for cal in calendars:
+        try:
+            events = cal.search(start=start, end=end, event=True, expand=True)
+            for ev in events:
+                cal_data = iCalendar.from_ical(ev.data)
+                for component in cal_data.walk():
+                    if component.name == "VEVENT":
+                        d = _fmt_event(component)
+                        d["calendar"] = cal.name or ""
+                        results.append(d)
+        except Exception:  # noqa: BLE001
+            continue
+
+    return results
 
 
-def get_event(api: Any, event_uid: str) -> dict | None:
+def get_event(
+    apple_id: str,
+    app_password: str,
+    event_uid: str,
+) -> dict | None:
     """Return a single event by UID, or None if not found."""
-    # Search in the next 90 days — widen if not found
-    now = datetime.now(tz=timezone.utc)
-    for window in [90, 365]:
-        events = api.calendar.events(now - timedelta(days=window), now + timedelta(days=window))
-        for e in events:
-            data = e.get("fields", e) if hasattr(e, "get") else {}
-            if data.get("guid") == event_uid:
-                return _fmt_event(e)
+    client = _client(apple_id, app_password)
+    principal = client.principal()
+
+    for cal in principal.calendars():
+        try:
+            events = cal.search(event=True)
+            for ev in events:
+                cal_data = iCalendar.from_ical(ev.data)
+                for component in cal_data.walk():
+                    if component.name == "VEVENT":
+                        uid = str(component.get("uid", ""))
+                        if uid == event_uid:
+                            d = _fmt_event(component)
+                            d["calendar"] = cal.name or ""
+                            return d
+        except Exception:  # noqa: BLE001
+            continue
+
     return None
 
 
 def create_event(
-    api: Any,
+    apple_id: str,
+    app_password: str,
     title: str,
     start: str,
     end: str,
@@ -89,11 +147,12 @@ def create_event(
     Create a new calendar event.
 
     Args:
-        api: Authenticated PyiCloudService instance.
+        apple_id: iCloud Apple ID.
+        app_password: App-specific password.
         title: Event title.
         start: ISO-8601 start datetime.
         end: ISO-8601 end datetime.
-        calendar_uid: Calendar to add the event to (uses default if omitted).
+        calendar_uid: Calendar to add the event to (uses first calendar if omitted).
         location: Optional location string.
         description: Optional description / notes.
 
@@ -103,20 +162,43 @@ def create_event(
     start_dt = dateparser.parse(start)
     end_dt = dateparser.parse(end)
 
-    calendars = api.calendar.calendars()
+    client = _client(apple_id, app_password)
+    principal = client.principal()
+    calendars = principal.calendars()
+
     if calendar_uid:
-        cal = next((c for c in calendars if c.get("guid") == calendar_uid), None)
+        cal = next((c for c in calendars if str(c.id) == calendar_uid), None)
         if cal is None:
             raise ValueError(f"Calendar '{calendar_uid}' not found.")
     else:
-        cal = next((c for c in calendars if c.get("isDefault")), calendars[0])
+        cal = calendars[0]
 
-    event = api.calendar.add_event(
-        title=title,
-        start_date=start_dt,
-        end_date=end_dt,
-        location=location,
-        description=description,
-        guid=cal.get("guid"),
-    )
-    return _fmt_event(event)
+    # Build iCal payload
+    event_uid = str(uuid.uuid4())
+    ical = iCalendar()
+    ical.add("prodid", "-//icloud-mcp//EN")
+    ical.add("version", "2.0")
+
+    ev = iCalEvent()
+    ev.add("uid", event_uid)
+    ev.add("summary", title)
+    ev.add("dtstart", start_dt)
+    ev.add("dtend", end_dt)
+    ev.add("dtstamp", datetime.now(tz=timezone.utc))
+    if location:
+        ev.add("location", location)
+    if description:
+        ev.add("description", description)
+
+    ical.add_component(ev)
+    cal.add_event(ical.to_ical().decode())
+
+    return {
+        "uid": event_uid,
+        "title": title,
+        "start": start_dt.isoformat(),
+        "end": end_dt.isoformat(),
+        "location": location,
+        "description": description,
+        "calendar": cal.name or "",
+    }

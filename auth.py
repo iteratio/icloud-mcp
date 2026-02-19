@@ -78,30 +78,47 @@ def clear_credentials() -> None:
 
 
 def verify_credentials() -> bool:
-    """Test stored credentials by authenticating with iCloud."""
-    try:
-        from pyicloud import PyiCloudService
-        from pyicloud.exceptions import PyiCloudFailedLoginException
-    except ImportError:
-        print("Error: pyicloud not installed. Run: uv sync")
-        return False
+    """Test stored credentials against iCloud CalDAV and IMAP."""
+    import imaplib
+    import caldav
 
     apple_id, app_password = get_credentials()
-    print(f"Testing credentials for {apple_id} ...")
+    print(f"Testing credentials for {apple_id} ...\n")
 
+    # ── CalDAV (Calendar) ─────────────────────────────────────────────────
+    caldav_ok = False
     try:
-        api = PyiCloudService(apple_id, app_password)
-        if api.requires_2fa:
-            print(
-                "Two-factor authentication required.\n"
-                "The server will prompt for the 2FA code on first startup."
-            )
-        else:
-            print("Authentication successful.")
-        return True
-    except PyiCloudFailedLoginException:
-        print("Authentication failed. Check your Apple ID and app-specific password.")
-        return False
+        client = caldav.DAVClient(
+            url="https://caldav.icloud.com/",
+            username=apple_id,
+            password=app_password,
+        )
+        principal = client.principal()
+        cals = principal.calendars()
+        print(f"  CalDAV  ✓  ({len(cals)} calendar(s) found)")
+        caldav_ok = True
+    except Exception as exc:  # noqa: BLE001
+        print(f"  CalDAV  ✗  {exc}")
+
+    # ── IMAP (Mail) ───────────────────────────────────────────────────────
+    imap_ok = False
+    try:
+        conn = imaplib.IMAP4_SSL("imap.mail.me.com", 993)
+        conn.login(apple_id, app_password)
+        conn.logout()
+        print("  IMAP    ✓")
+        imap_ok = True
+    except Exception as exc:  # noqa: BLE001
+        print(f"  IMAP    ✗  {exc}")
+
+    print()
+    if caldav_ok and imap_ok:
+        print("All checks passed — credentials are valid.")
+    else:
+        print("One or more checks failed. Verify your Apple ID and app-specific password.")
+        print("Generate an app-specific password at: https://appleid.apple.com")
+
+    return caldav_ok and imap_ok
 
 
 if __name__ == "__main__":

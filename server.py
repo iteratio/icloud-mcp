@@ -2,68 +2,31 @@
 iCloud MCP Server
 
 Exposes iCloud Calendar, Mail, and Reminders as MCP tools.
+
+- Calendar: CalDAV (official Apple protocol, app-specific password)
+- Mail: IMAP/SMTP (official Apple protocol, app-specific password)
+- Reminders: EventKit/PyObjC (macOS native, no auth needed)
+
 Credentials are read from the macOS Keychain — never from env vars or files.
 
 Run:
-    uv run server.py
+    uv run python3 server.py
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from typing import Any
 
 import mcp.server.stdio
 import mcp.types as types
 from mcp.server import Server
-from pyicloud import PyiCloudService
-from pyicloud.exceptions import PyiCloudFailedLoginException
 
 from auth import get_credentials
 from tools import calendar as cal_tools
 from tools import mail as mail_tools
 from tools import reminders as rem_tools
-
-# ---------------------------------------------------------------------------
-# iCloud session (initialised lazily on first tool call)
-# ---------------------------------------------------------------------------
-
-_api: PyiCloudService | None = None
-
-
-def _get_api() -> PyiCloudService:
-    global _api
-    if _api is not None:
-        return _api
-
-    apple_id, app_password = get_credentials()
-
-    try:
-        api = PyiCloudService(apple_id, app_password)
-    except PyiCloudFailedLoginException as exc:
-        raise RuntimeError(
-            "iCloud login failed. Check your credentials: python auth.py verify"
-        ) from exc
-
-    if api.requires_2fa:
-        print(
-            "Two-factor authentication is required.\n"
-            "Enter the 6-digit code sent to your trusted device:",
-            flush=True,
-        )
-        code = input().strip()
-        if not api.validate_2fa_code(code):
-            raise RuntimeError("2FA code was not accepted by Apple.")
-        if not api.is_trusted_session:
-            api.trust_session()
-
-    _api = api
-    return _api
-
-
-# ---------------------------------------------------------------------------
-# Server setup
-# ---------------------------------------------------------------------------
 
 server = Server("icloud-mcp")
 
@@ -88,7 +51,7 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "from_date": {
                         "type": "string",
-                        "description": "Start date (ISO-8601, e.g. 2025-03-01). Defaults to today.",
+                        "description": "Start date (ISO-8601). Defaults to today.",
                     },
                     "to_date": {
                         "type": "string",
@@ -120,23 +83,14 @@ async def list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {
                     "title": {"type": "string", "description": "Event title."},
-                    "start": {
-                        "type": "string",
-                        "description": "Start datetime (ISO-8601).",
-                    },
-                    "end": {
-                        "type": "string",
-                        "description": "End datetime (ISO-8601).",
-                    },
+                    "start": {"type": "string", "description": "Start datetime (ISO-8601)."},
+                    "end": {"type": "string", "description": "End datetime (ISO-8601)."},
                     "calendar_uid": {
                         "type": "string",
-                        "description": "Target calendar UID (uses default if omitted).",
+                        "description": "Target calendar UID (uses first calendar if omitted).",
                     },
                     "location": {"type": "string", "description": "Optional location."},
-                    "description": {
-                        "type": "string",
-                        "description": "Optional notes / description.",
-                    },
+                    "description": {"type": "string", "description": "Optional notes."},
                 },
                 "required": ["title", "start", "end"],
             },
@@ -144,7 +98,7 @@ async def list_tools() -> list[types.Tool]:
         # ── Mail ──────────────────────────────────────────────────────────
         types.Tool(
             name="mail_list_mailboxes",
-            description="List all iCloud Mail mailboxes / folders with unread counts.",
+            description="List all iCloud Mail mailboxes / folders.",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
@@ -153,10 +107,7 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "mailbox": {
-                        "type": "string",
-                        "description": "Mailbox name (default: INBOX).",
-                    },
+                    "mailbox": {"type": "string", "description": "Mailbox name (default: INBOX)."},
                     "limit": {
                         "type": "integer",
                         "description": "Max messages to return (default 20, max 100).",
@@ -190,10 +141,7 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "to": {
-                        "type": "string",
-                        "description": "Recipient address (or comma-separated list).",
-                    },
+                    "to": {"type": "string", "description": "Recipient address (or comma-separated list)."},
                     "subject": {"type": "string", "description": "Email subject."},
                     "body": {"type": "string", "description": "Plain-text body."},
                     "cc": {"type": "string", "description": "Optional CC addresses."},
@@ -237,14 +185,8 @@ async def list_tools() -> list[types.Tool]:
                         "type": "string",
                         "description": "Target list UID (uses default list if omitted).",
                     },
-                    "due": {
-                        "type": "string",
-                        "description": "Optional due date/time (ISO-8601).",
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Optional notes.",
-                    },
+                    "due": {"type": "string", "description": "Optional due date/time (ISO-8601)."},
+                    "description": {"type": "string", "description": "Optional notes."},
                     "priority": {
                         "type": "integer",
                         "description": "Priority: 0=none, 1=high, 5=medium, 9=low.",
@@ -269,31 +211,35 @@ async def list_tools() -> list[types.Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
-    api = _get_api()
-
     try:
         result: Any
 
+        # Credentials needed for CalDAV + IMAP tools (not Reminders)
+        if name.startswith("calendar_") or name.startswith("mail_"):
+            apple_id, app_password = get_credentials()
+
         # ── Calendar ──────────────────────────────────────────────────────
         if name == "calendar_list_calendars":
-            result = cal_tools.list_calendars(api)
+            result = cal_tools.list_calendars(apple_id, app_password)
 
         elif name == "calendar_list_events":
             result = cal_tools.list_events(
-                api,
+                apple_id,
+                app_password,
                 from_date=arguments.get("from_date"),
                 to_date=arguments.get("to_date"),
                 calendar_uid=arguments.get("calendar_uid"),
             )
 
         elif name == "calendar_get_event":
-            result = cal_tools.get_event(api, arguments["event_uid"])
+            result = cal_tools.get_event(apple_id, app_password, arguments["event_uid"])
             if result is None:
                 result = {"error": f"Event '{arguments['event_uid']}' not found."}
 
         elif name == "calendar_create_event":
             result = cal_tools.create_event(
-                api,
+                apple_id,
+                app_password,
                 title=arguments["title"],
                 start=arguments["start"],
                 end=arguments["end"],
@@ -304,11 +250,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
 
         # ── Mail ──────────────────────────────────────────────────────────
         elif name == "mail_list_mailboxes":
-            result = mail_tools.list_mailboxes(api)
+            result = mail_tools.list_mailboxes(apple_id, app_password)
 
         elif name == "mail_list_messages":
             result = mail_tools.list_messages(
-                api,
+                apple_id,
+                app_password,
                 mailbox=arguments.get("mailbox", "INBOX"),
                 limit=arguments.get("limit", 20),
                 unread_only=arguments.get("unread_only", False),
@@ -316,7 +263,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
 
         elif name == "mail_get_message":
             result = mail_tools.get_message(
-                api,
+                apple_id,
+                app_password,
                 uid=arguments["uid"],
                 mailbox=arguments.get("mailbox", "INBOX"),
             )
@@ -325,7 +273,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
 
         elif name == "mail_send_message":
             result = mail_tools.send_message(
-                api,
+                apple_id,
+                app_password,
                 to=arguments["to"],
                 subject=arguments["subject"],
                 body=arguments["body"],
@@ -333,20 +282,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                 bcc=arguments.get("bcc", ""),
             )
 
-        # ── Reminders ─────────────────────────────────────────────────────
+        # ── Reminders (EventKit — no credentials needed) ──────────────────
         elif name == "reminders_list_lists":
-            result = rem_tools.list_lists(api)
+            result = rem_tools.list_lists()
 
         elif name == "reminders_list_reminders":
             result = rem_tools.list_reminders(
-                api,
                 list_uid=arguments.get("list_uid"),
                 include_completed=arguments.get("include_completed", False),
             )
 
         elif name == "reminders_create_reminder":
             result = rem_tools.create_reminder(
-                api,
                 title=arguments["title"],
                 list_uid=arguments.get("list_uid"),
                 due=arguments.get("due"),
@@ -355,7 +302,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             )
 
         elif name == "reminders_complete_reminder":
-            found = rem_tools.complete_reminder(api, arguments["uid"])
+            found = rem_tools.complete_reminder(arguments["uid"])
             result = {"completed": found}
 
         else:
@@ -364,15 +311,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
     except Exception as exc:  # noqa: BLE001
         result = {"error": str(exc)}
 
-    import json
-
     return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-
 
 async def _run() -> None:
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
@@ -385,7 +329,6 @@ async def _run() -> None:
 
 def main() -> None:
     import asyncio
-
     try:
         asyncio.run(_run())
     except KeyboardInterrupt:
